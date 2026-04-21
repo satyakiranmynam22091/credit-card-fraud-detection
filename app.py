@@ -27,31 +27,26 @@ SMTP_PORT = int(os.getenv("SMTP_PORT", 587))
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
 
-# -------- DEBUG PRINTS (CHECK IF ENV LOADED) --------
-print("DATABASE_URL:", DATABASE_URL)
-print("SMTP_SERVER:", SMTP_SERVER)
-print("EMAIL_USER:", EMAIL_USER)
-
 # ---------------- DATABASE ----------------
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 # ---------------- APP ----------------
-app = FastAPI(title="AI-Powered Fraud Detection API")
+app = FastAPI(title="AI Fraud Detection API")
 
 # ---------------- SECURITY ----------------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
-# ---------------- LOAD ML MODEL ----------------
+# ---------------- ML MODEL ----------------
 try:
     model = joblib.load("fraud_model.pkl")
-    print("✅ ML Model Loaded Successfully")
-except Exception as e:
-    print("❌ Failed to load ML model:", e)
+    print("ML Model Loaded")
+except:
     model = None
+    print("Model not loaded")
 
-# ---------------- DB DEPENDENCY ----------------
+# ---------------- DB SESSION ----------------
 def get_db():
     db = SessionLocal()
     try:
@@ -59,32 +54,21 @@ def get_db():
     finally:
         db.close()
 
-# ---------------- JWT FUNCTIONS ----------------
+# ---------------- JWT ----------------
 def create_access_token(data: dict):
-    to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    data.update({"exp": expire})
+    return jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
 
-def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security)
-):
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
-        payload = jwt.decode(
-            credentials.credentials,
-            SECRET_KEY,
-            algorithms=[ALGORITHM]
-        )
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         return payload
     except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-# ---------------- EMAIL FUNCTION ----------------
-def send_email(to_email: str, subject: str, body: str):
-    if not SMTP_SERVER or not EMAIL_USER or not EMAIL_PASSWORD:
-        print("⚠ Email settings not configured properly.")
-        return
-
+# ---------------- EMAIL ----------------
+def send_email(to_email, subject, body):
     try:
         msg = MIMEText(body)
         msg["Subject"] = subject
@@ -96,27 +80,35 @@ def send_email(to_email: str, subject: str, body: str):
         server.login(EMAIL_USER, EMAIL_PASSWORD)
         server.sendmail(EMAIL_USER, to_email, msg.as_string())
         server.quit()
-
-        print("✅ Email sent successfully")
-
     except Exception as e:
-        print("❌ Email failed:", e)
+        print("Email error:", e)
 
 # ---------------- REGISTER ----------------
 @app.post("/register/")
 def register(username: str, password: str, db: Session = Depends(get_db)):
-    hashed_password = pwd_context.hash(password)
-
     try:
+        user = db.execute(
+            text("SELECT * FROM users WHERE username=:u"),
+            {"u": username}
+        ).fetchone()
+
+        if user:
+            raise HTTPException(status_code=400, detail="Username already exists")
+
+        hashed_password = pwd_context.hash(password)
+
         db.execute(
             text("INSERT INTO users (username, password) VALUES (:u, :p)"),
             {"u": username, "p": hashed_password}
         )
-        db.commit()
-    except:
-        raise HTTPException(status_code=400, detail="Username already exists")
 
-    return {"message": "User registered successfully"}
+        db.commit()
+        return {"message": "User registered successfully"}
+
+    except Exception as e:
+        db.rollback()
+        print("Register error:", e)
+        raise HTTPException(status_code=500, detail="Registration failed")
 
 # ---------------- LOGIN ----------------
 @app.post("/login/")
@@ -129,109 +121,82 @@ def login(username: str, password: str, db: Session = Depends(get_db)):
     if not user or not pwd_context.verify(password, user.password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    access_token = create_access_token({"sub": username})
-    return {"access_token": access_token}
+    token = create_access_token({"sub": username})
+    return {"access_token": token}
 
-# ---------------- CREATE ACCOUNT ----------------
+# ---------------- ACCOUNT ----------------
 @app.post("/account/")
-def create_account(
-    email: str,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
+def create_account(email: str, db: Session = Depends(get_db), user=Depends(get_current_user)):
     db.execute(
-        text("""
-        INSERT INTO accounts (email, status)
-        VALUES (:email, 'active')
-        """),
-        {"email": email}
+        text("INSERT INTO accounts (email, status) VALUES (:e, 'active')"),
+        {"e": email}
     )
     db.commit()
+    return {"message": "Account created"}
 
-    return {"message": "Account created successfully"}
-
-# ---------------- TRANSACTION ROUTE ----------------
+# ---------------- TRANSACTION ----------------
 @app.post("/transaction/")
-def create_transaction(
-    account_id: int,
-    amount: float,
-    background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
-    current_user: dict = Depends(get_current_user)
-):
+def transaction(account_id: int, amount: float, background_tasks: BackgroundTasks,
+                db: Session = Depends(get_db), user=Depends(get_current_user)):
 
-    account = db.execute(
+    acc = db.execute(
         text("SELECT * FROM accounts WHERE account_id=:id"),
         {"id": account_id}
     ).fetchone()
 
-    if not account:
+    if not acc:
         raise HTTPException(status_code=404, detail="Account not found")
 
-    if account.status == "blocked":
-        raise HTTPException(status_code=403, detail="This account is blocked")
+    if acc.status == "blocked":
+        raise HTTPException(status_code=403, detail="Account blocked")
 
     if not model:
-        raise HTTPException(status_code=500, detail="ML model not loaded")
+        raise HTTPException(status_code=500, detail="Model not loaded")
 
-    # ---- ML INPUT (30 features)
     input_data = np.zeros((1, 30))
     input_data[0][-1] = amount
 
-    probability = model.predict_proba(input_data)[0][1]
-    risk_score = round(float(probability), 4)
+    risk_score = float(model.predict_proba(input_data)[0][1])
 
-    transaction_status = "approved"
-
+    status = "approved"
     if risk_score > FRAUD_THRESHOLD:
-        transaction_status = "blocked"
+        status = "blocked"
         db.execute(
             text("UPDATE accounts SET status='blocked' WHERE account_id=:id"),
             {"id": account_id}
         )
 
-    # ---- SAVE TRANSACTION
     db.execute(
         text("""
         INSERT INTO transactions (account_id, amount, risk_score, status)
-        VALUES (:account_id, :amount, :risk_score, :status)
+        VALUES (:a, :m, :r, :s)
         """),
-        {
-            "account_id": account_id,
-            "amount": amount,
-            "risk_score": risk_score,
-            "status": transaction_status
-        }
+        {"a": account_id, "m": amount, "r": risk_score, "s": status}
     )
 
     db.commit()
 
-    # ---- EMAIL USER
-    if account.email:
-        subject = f"Transaction Alert - Account #{account_id}"
-        body = f"""
-Transaction Alert
+    # Email user
+    if acc.email:
+        background_tasks.add_task(
+            send_email,
+            acc.email,
+            "Transaction Alert",
+            f"Amount: {amount}\nRisk: {risk_score}\nStatus: {status}"
+        )
 
-Account ID: {account_id}
-Amount: {amount}
-Risk Score: {risk_score}
-Status: {transaction_status}
-Time: {datetime.utcnow()}
-"""
-        background_tasks.add_task(send_email, account.email, subject, body)
-
-    # ---- EMAIL ADMIN
-    if transaction_status == "blocked" and ADMIN_EMAIL:
+    # Email admin
+    if status == "blocked" and ADMIN_EMAIL:
         background_tasks.add_task(
             send_email,
             ADMIN_EMAIL,
-            "🚨 Fraud Alert Detected",
-            f"Fraud detected on Account {account_id}\nRisk Score: {risk_score}"
+            "Fraud Alert",
+            f"Account {account_id} blocked\nRisk: {risk_score}"
         )
 
     return {
         "account_id": account_id,
         "amount": amount,
         "risk_score": risk_score,
-        "transaction_status": transaction_status
+        "status": status
     }
